@@ -2,6 +2,7 @@ import os
 import random
 import string
 from transport import TransportSocket, ReadMode
+import time
 
 def generate_random_data(size):
     """
@@ -18,19 +19,19 @@ def client_main():
     file_name = "alice.txt"
     with open(file_name, "rb") as f:
         file_data = f.read()
-        print(f"Client: Sending file '{file_name}' to the server...")
+        print(str(time.time()), f"Client: Sending file '{file_name}' to the server...")
         client_socket.send(file_data)
 
     # Send randomly generated data to the server
     random_data = generate_random_data(128)
-    print(f"Client: Sending randomly generated data to the server...")
+    print(str(time.time()), f"Client: Sending randomly generated data to the server...")
     client_socket.send(random_data)
 
     # Receive data from the server
-    print("Client: Waiting to receive data from the server...")
+    print(str(time.time()), "Client: Waiting to receive data from the server...")
     buf = [b""]
     client_socket.recv(buf, 1024, flags=ReadMode.NO_FLAG)
-    print(f"Client: Received data from server:\n{buf[0].decode()}")
+    print(str(time.time()), f"Client: Received data from server:\n{buf[0].decode()}")
 
     # Close the client socket
     client_socket.close()
