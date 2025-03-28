@@ -25,9 +25,6 @@ TIME_WAIT = 8
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 
-# Use MSS from grading instead of a hardcoded value for better compatibility
-SAFE_MSS = 1024
-
 # Debug mode - set to False to disable verbose output
 DEBUG = False
 
@@ -44,6 +41,10 @@ class ReadMode:
 
 
 class Packet:
+    """
+    Basic class that simulates the fields for a packet being sent between a client and server
+    """
+    
     def __init__(self, seq=0, ack=0, flags=0, adv_window=MAX_NETWORK_BUFFER, payload=b""):
         self.seq = seq
         self.ack = ack
@@ -92,6 +93,10 @@ class Packet:
 
 
 class TransportSocket:
+    """
+    Handles the sending and receiving of different types of packets between a client and server
+    """
+    
     def __init__(self):
         self.sock_fd = None
 
@@ -117,13 +122,10 @@ class TransportSocket:
         
         # Add RTT estimation
         self.rtt_stats = {
-            "srtt": 0,          # Smoothed RTT (EstimatedRTT)
-            "rttvar": 0,        # RTT variance
-            "rto": DEFAULT_TIMEOUT,  # Retransmission timeout
-            "alpha": 0.125,     # EWMA weight factor for SRTT (RFC recommends 0.125)
-            "beta": 0.25,       # EWMA weight factor for RTTVAR (RFC recommends 0.25)
-            "send_times": {},   # Track send times of packets for RTT measurement
-            "first_measurement": True, # Flag for first measurement
+            "srtt": 0,                  # Smoothed RTT (EstimatedRTT)
+            "rto": DEFAULT_TIMEOUT,     # Retransmission timeout
+            "send_times": {},           # Track send times of packets for RTT measurement
+            "first_measurement": True,  # Flag for first measurement
         }
 
         # Enhanced window management
@@ -226,11 +228,6 @@ class TransportSocket:
     def recv(self, buf, length, flags):
         """
         Retrieve received data from the buffer, with optional blocking behavior.
-
-        :param buf: Buffer to store received data (list of bytes or bytearray).
-        :param length: Maximum length of data to read
-        :param flags: ReadMode flag to control blocking behavior
-        :return: Number of bytes read
         """
         read_len = 0
 
@@ -306,6 +303,7 @@ class TransportSocket:
         # While there's data left to send
         while offset < total_len and not self.dying:
             with self.wait_cond:  # Use wait_cond to properly wait for window updates
+                
                 # Wait for window space to be available
                 while self.window["peer_adv_window"] <= 0 and not self.dying:
                     print(f"Flow control: zero window, waiting for update from peer")
@@ -329,7 +327,7 @@ class TransportSocket:
                 # Calculate how much we can send in this segment
                 available_window = min(
                     self.window["peer_adv_window"],  # Respect peer's advertised window
-                    SAFE_MSS  # Don't exceed our segment size
+                    1024  # Don't exceed our segment size
                 )
                 
                 payload_len = min(available_window, total_len - offset)
@@ -403,28 +401,6 @@ class TransportSocket:
         if self.window["packets_in_flight"]:
             print(f"Warning: Giving up waiting for ACKs after {max_wait_time} seconds")
 
-    def wait_for_ack(self, ack_goal):
-        """
-        Wait for 'next_seq_expected' to reach or exceed 'ack_goal' within RTO.
-        Return True if ack arrived in time; False on timeout.
-        """
-        with self.recv_lock:
-            start = time.time()
-            timeout = self.rtt_stats["rto"]
-            while self.window["next_seq_expected"] < ack_goal:
-                elapsed = time.time() - start
-                remaining = timeout - elapsed
-                if remaining <= 0:
-                    return False
-
-                self.wait_cond.wait(timeout=remaining)
-                
-                # return early if socket is closing
-                if self.dying:
-                    return False
-
-            return True
-
     def backend(self):
         """
         Backend loop to handle receiving data and sending acknowledgments.
@@ -432,10 +408,11 @@ class TransportSocket:
         """
         while not self.dying:
             try:
+                # Retransmission of the SYN+ACK packet if it gets lost in transmission
                 if self.state == SYN_RCVD and self.last_syn_ack_time is not None:
                     current_time = time.time()
                     if (current_time - self.last_syn_ack_time > self.rtt_stats["rto"] and 
-                        self.syn_ack_retries < 5):
+                        self.syn_ack_retries < 5):  # Maximum of 5 retransmissions for SYN+ACK packet
                         
                         # Retransmit the SYN-ACK
                         initial_seq = self.window["next_seq_to_send"] - 1
@@ -558,7 +535,6 @@ class TransportSocket:
                                 adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
                             )
 
-                            # With these lines:
                             encoded_ack = ack_packet.encode()
                             self.sock_fd.sendto(encoded_ack, addr)
                             print(f"Sent ACK to complete handshake")
@@ -624,8 +600,7 @@ class TransportSocket:
                         self.state = CLOSE_WAIT
                         self.wait_cond.notify_all()
                         
-                        # In a real application, the app would close the socket when ready
-                        # For this simplified implementation, we'll send FIN immediately
+                        # Send FIN immediately
                         next_seq = self.window["next_seq_to_send"]
                         fin_packet = Packet(
                             seq=next_seq, 
@@ -728,7 +703,7 @@ class TransportSocket:
                     with self.recv_lock:
                         # Process acknowledged data
                         if packet.ack > self.window["next_seq_expected"]:
-                            # New ACK, reset duplicate ACK counter
+                            # New ACK acknowledging new data, reset duplicate ACK counter
                             self.window["dup_ack_count"] = 0
                             
                             # Calculate how many bytes were acknowledged
@@ -776,22 +751,33 @@ class TransportSocket:
                                 # Triple duplicate ACK detected, trigger fast retransmit
                                 print(f"Triple duplicate ACK detected, triggering fast retransmit for ACK {packet.ack}")
                                 
-                                # The segment to retransmit is the one with sequence number equal to the ACK number
-                                # of the duplicate ACKs
+                                # The sequence number of the missing segment is the same as the ACK number
                                 missing_seq = packet.ack
                                 
                                 # Find the segment to retransmit
                                 if missing_seq in self.window["packets_in_flight"]:
                                     # Found the packet to retransmit
                                     pkt, _ = self.window["packets_in_flight"][missing_seq]
-                                    print(f"Fast retransmitting packet with seq {missing_seq}")
+                                    print(f"Fast retransmitting packet with seq {missing_seq}, length {len(pkt.payload)} bytes")
                                     self.sock_fd.sendto(pkt.encode(), self.conn)
-                                    # Update send time
+                                    # Update send time for RTT calculation
                                     self.window["packets_in_flight"][missing_seq] = (pkt, time.time())
                                 else:
-                                    print(f"No packet found to retransmit for ACK {packet.ack}")
+                                    # If the exact packet isn't found, search for a packet that covers this sequence range
+                                    found = False
+                                    for seq, (pkt, _) in sorted(self.window["packets_in_flight"].items()):
+                                        if seq <= missing_seq < seq + len(pkt.payload):
+                                            print(f"Fast retransmitting packet with seq {seq} that contains missing seq {missing_seq}")
+                                            self.sock_fd.sendto(pkt.encode(), self.conn)
+                                            self.window["packets_in_flight"][seq] = (pkt, time.time())
+                                            found = True
+                                            break
+                                    
+                                    if not found:
+                                        print(f"No packet found to retransmit for ACK {packet.ack}")
                                 
                                 # Reset the duplicate ACK counter after fast retransmit
+                                # This allows us to detect new losses after this retransmission
                                 self.window["dup_ack_count"] = 0
 
                 # Data packet processing (if in ESTABLISHED state)
@@ -871,7 +857,7 @@ class TransportSocket:
         """
         print(f"{time.time()} Initiating connection establishment...")
         
-        # Initialize sequence number (can be random, but we'll use 0 for simplicity)
+        # Initialize sequence number (using 0 for simplicity)
         initial_seq = 0
         self.window["next_seq_to_send"] = initial_seq + 1  # SYN consumes one sequence number
         
@@ -918,19 +904,6 @@ class TransportSocket:
         # If we exit the loop without establishing connection
         if self.state != ESTABLISHED:
             raise ConnectionError("Failed to establish connection after multiple retries")
-        
-    def accept_connection(self):
-        """
-        Accept a connection request (server side)
-        """
-        print(f"{time.time()} Waiting for connection...")
-        
-        # Wait for SYN to arrive (handled by backend)
-        with self.wait_cond:
-            while self.state != SYN_RCVD:
-                self.wait_cond.wait()
-        
-        print(f"{time.time()} Connection accepted")
 
     def terminate_connection(self):
         """
@@ -1007,8 +980,8 @@ class TransportSocket:
                 
     def update_rtt(self, seq_no):
         """
-        Update RTT estimation when an ACK is received using EWMA.
-        Implements the algorithm specified in RFC 6298.
+        Update RTT estimation when an ACK is received using the original TCP algorithm.
+        Implements a simple EWMA calculation with TimeOut = 2 x EstimatedRTT.
         """
         if seq_no in self.rtt_stats["send_times"]:
             # Calculate sample RTT
@@ -1018,31 +991,23 @@ class TransportSocket:
             # Skip very small measurements (likely delayed ACKs)
             if sample_rtt < 0.001:
                 return
-                
-            alpha = self.rtt_stats["alpha"]
-            beta = self.rtt_stats["beta"]
+            
+            # Let's use 0.875 (7/8) as a reasonable value
+            alpha = 0.875
             
             if self.rtt_stats["first_measurement"]:
-                # First measurement: initialize values (RFC 6298 recommendation)
+                # First measurement: initialize EstimatedRTT
                 self.rtt_stats["srtt"] = sample_rtt
-                self.rtt_stats["rttvar"] = sample_rtt / 2
                 self.rtt_stats["first_measurement"] = False
             else:
-                # RFC 6298 algorithm:
-                # RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - R'|
-                # SRTT = (1 - alpha) * SRTT + alpha * R'
-                
-                # First update RTTVAR (using old SRTT)
-                self.rtt_stats["rttvar"] = (1 - beta) * self.rtt_stats["rttvar"] + \
-                                          beta * abs(self.rtt_stats["srtt"] - sample_rtt)
-                
-                # Then update SRTT
-                self.rtt_stats["srtt"] = (1 - alpha) * self.rtt_stats["srtt"] + alpha * sample_rtt
+                # Original TCP algorithm:
+                # EstimatedRTT = alpha × EstimatedRTT + (1 - alpha) × SampleRTT
+                self.rtt_stats["srtt"] = alpha * self.rtt_stats["srtt"] + (1 - alpha) * sample_rtt
             
-            # Set RTO = SRTT + 4 * RTTVAR (RFC 6298 recommendation)
-            self.rtt_stats["rto"] = self.rtt_stats["srtt"] + 4 * self.rtt_stats["rttvar"]
+            # Set timeout as per original algorithm: TimeOut = 2 × EstimatedRTT
+            self.rtt_stats["rto"] = 2 * self.rtt_stats["srtt"]
             
-            # Limit RTO to reasonable bounds (RFC 6298 suggests min of 1s)
-            self.rtt_stats["rto"] = max(1.0, min(DEFAULT_TIMEOUT, self.rtt_stats["rto"]))
+            # Ensure RTO doesn't exceed the default timeout
+            self.rtt_stats["rto"] = min(DEFAULT_TIMEOUT, self.rtt_stats["rto"])
             
-            print(f"RTT update: sample={sample_rtt:.4f}s, SRTT={self.rtt_stats['srtt']:.4f}s, RTO={self.rtt_stats['rto']:.4f}s")
+            print(f"RTT update: sample={sample_rtt:.4f}s, EstimatedRTT={self.rtt_stats['srtt']:.4f}s, TimeOut={self.rtt_stats['rto']:.4f}s")
