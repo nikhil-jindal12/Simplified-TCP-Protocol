@@ -3,7 +3,7 @@ import struct
 import threading
 import time
 import random
-from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER
+from grading import *
 
 # Constants for simplified TCP
 SYN_FLAG = 0x8   # Synchronization flag 
@@ -120,6 +120,14 @@ class TransportSocket:
         # FSM state
         self.state = CLOSED
         
+        # Congestion control parameters
+        self.congestion_control = {
+            "cwnd": WINDOW_INITIAL_WINDOW_SIZE,  # Initial congestion window (1 MSS)
+            "ssthresh": WINDOW_INITIAL_SSTHRESH, # Initial slow start threshold
+            "state": "slow_start",               # Current congestion state
+            "segments_acked": 0,                 # Counter for congestion avoidance
+        }
+        
         # Add RTT estimation
         self.rtt_stats = {
             "srtt": 0,                  # Smoothed RTT (EstimatedRTT)
@@ -195,6 +203,12 @@ class TransportSocket:
             self.dying = True
         finally:
             self.death_lock.release()
+            
+        # Clear any in-flight packets
+        with self.recv_lock:
+            self.window["packets_in_flight"] = {}
+            self.window["in_flight"] = 0
+            self.wait_cond.notify_all()
 
         if self.thread:
             self.thread.join()
@@ -205,6 +219,7 @@ class TransportSocket:
             print(f"{time.time()} Error: Null socket")
             return EXIT_ERROR
 
+        print("Socket fully closed and all resources cleaned up")
         return EXIT_SUCCESS
 
     def send(self, data):
@@ -221,6 +236,19 @@ class TransportSocket:
         # Only send data if we're in ESTABLISHED state
         if self.state != ESTABLISHED:
             raise ValueError(f"Cannot send data in state {self.state}")
+        
+        # Make sure the connection is fully established
+        if self.connection_establishing:
+            with self.wait_cond:
+                print("Waiting for connection to fully complete before sending data...")
+                while self.connection_establishing and not self.dying:
+                    self.wait_cond.wait(timeout=0.5)
+                
+                # Double-check state again
+                if self.state != ESTABLISHED:
+                    raise ValueError(f"Connection state changed during wait, now in state {self.state}")
+                    
+                print("Connection fully established, proceeding with data transmission")
 
         with self.send_lock:
             self.send_segment(data)
@@ -290,6 +318,16 @@ class TransportSocket:
         """
         Send 'data' in multiple smaller segments with flow control
         """
+        # At the beginning of the method:
+        print(f"--- Congestion Control Status ---")
+        print(f"State: {self.congestion_control['state']}")
+        print(f"cwnd: {self.congestion_control['cwnd']} bytes")
+        print(f"ssthresh: {self.congestion_control['ssthresh']} bytes")
+        print(f"in-flight data: {self.window['in_flight']} bytes")
+        print(f"RTT: {self.rtt_stats['srtt']:.4f}s, RTO: {self.rtt_stats['rto']:.4f}s")
+        print(f"Network conditions: using high-loss parameters")
+        print(f"--------------------------------")
+        
         # Check if we're in ESTABLISHED state
         if self.state != ESTABLISHED:
             print(f"Cannot send data in state {self.state}")
@@ -299,6 +337,8 @@ class TransportSocket:
         total_len = len(data)
         
         print(f"Sending {total_len} bytes of data")
+        
+        last_print = time.time()
 
         # While there's data left to send
         while offset < total_len and not self.dying:
@@ -324,11 +364,26 @@ class TransportSocket:
                 if self.dying:
                     break
                     
-                # Calculate how much we can send in this segment
-                available_window = min(
-                    self.window["peer_adv_window"],  # Respect peer's advertised window
-                    1024  # Don't exceed our segment size
+                # Calculate how much we can send in this segment considering both
+                # flow control (peer's advertised window) and congestion control (cwnd)
+                effective_window = min(
+                    self.window["peer_adv_window"],         # Flow control
+                    self.congestion_control["cwnd"] - self.window["in_flight"]  # Congestion control
                 )
+
+                available_window = min(
+                    effective_window,  
+                    MSS  # Don't exceed our Maximum Segment Size
+                )
+
+                # Print the congestion control stats every 0.001 seconds
+                if self.state != CLOSED and not self.dying:
+                    if time.time() - last_print > 0.1:
+                        print(f"Congestion control: cwnd={self.congestion_control['cwnd']}, " +
+                            f"ssthresh={self.congestion_control['ssthresh']}, " +
+                            f"state={self.congestion_control['state']}, " +
+                            f"effective_window={effective_window}")
+                        last_print = time.time()
                 
                 payload_len = min(available_window, total_len - offset)
                 
@@ -375,27 +430,55 @@ class TransportSocket:
         """
         start_time = time.time()
         max_wait_time = 30  # Maximum time to wait in seconds
+        max_retries = 10    # Maximum retries per packet
+        
+        retries_per_packet = {}   # Track retransmission attempts per packet
         
         # Wait while we have packets in flight and haven't hit the timeout
-        while self.window["packets_in_flight"] and time.time() - start_time < max_wait_time:
+        while self.window["packets_in_flight"] and time.time() - start_time < max_wait_time and self.state != CLOSED and not self.dying:
             # Check for packets that need retransmission
             current_time = time.time()
             packets_to_retransmit = []
             
             with self.recv_lock:
                 for seq, (packet, send_time) in list(self.window["packets_in_flight"].items()):
-                    if current_time - send_time > self.rtt_stats["rto"]:
-                        packets_to_retransmit.append((seq, packet))
+                    # Initialize retry counter for this packet if not exists
+                        if seq not in retries_per_packet:
+                            retries_per_packet[seq] = 0
+                            
+                        # Check if packet needs retransmission
+                        if current_time - send_time > self.rtt_stats["rto"]:
+                            # Check if we've reached max retries for this packet
+                            if retries_per_packet[seq] < max_retries:
+                                packets_to_retransmit.append((seq, packet))
+                                retries_per_packet[seq] += 1
+                            else:
+                                print(f"Maximum retries ({max_retries}) reached for packet {seq}, giving up")
+                                # For TCP Tahoe, consider this a loss and update congestion control
+                                self.update_congestion_control_on_timeout()
+                                # Remove from in-flight to avoid infinite retries
+                                del self.window["packets_in_flight"][seq]
             
-            # Retransmit packets outside the lock to avoid deadlock
-            for seq, packet in packets_to_retransmit:
-                print(f"Retransmitting segment (seq={seq}, len={len(packet.payload)})")
-                self.sock_fd.sendto(packet.encode(), self.conn)
-                with self.recv_lock:
-                    self.window["packets_in_flight"][seq] = (packet, current_time)
+            # If packets time out, consider it congested and update congestion
+            if packets_to_retransmit:
+                self.update_congestion_control_on_timeout()
+            
+                # Retransmit packets outside the lock to avoid deadlock
+                for seq, packet in packets_to_retransmit:
+                    if self.state != CLOSED and not self.dying:
+                        print(f"Retransmitting segment (seq={seq}, len={len(packet.payload)})")
+                        self.sock_fd.sendto(packet.encode(), self.conn)
+                        with self.recv_lock:
+                            self.window["packets_in_flight"][seq] = (packet, current_time)
             
             # Sleep briefly to avoid busy waiting
             time.sleep(0.01)
+            
+        # Clear in-flight packets if connection closed
+        if self.state == CLOSED or self.dying:
+            with self.recv_lock:
+                self.window["packets_in_flight"] = {}
+                self.window["in_flight"] = 0
         
         # If we still have packets in flight after the timeout, log a warning
         if self.window["packets_in_flight"]:
@@ -432,25 +515,27 @@ class TransportSocket:
                     self.final_handshake_ack is not None and self.final_ack_time is not None):
                     
                     current_time = time.time()
-                    # Use a shorter timeout for the final ACK retransmission
-                    timeout = min(1.0, self.rtt_stats["rto"])
+                    # Increase the timeout for high-latency networks
+                    timeout = min(2.0, self.rtt_stats["rto"] * 1.5)  # Increased from 1.0 to 1.5
                     
                     if (current_time - self.final_ack_time > timeout and
                         self.final_ack_retries < 5):
-                        
                         # Retransmit final ACK
                         self.sock_fd.sendto(self.final_handshake_ack, self.conn)
                         self.final_ack_time = current_time
                         self.final_ack_retries += 1
                         print(f"Retransmitting final handshake ACK (attempt {self.final_ack_retries}/5)")
                     
-                    # After 5 successful retransmissions or 10 seconds, assume connection is established
-                    elif (self.final_ack_retries >= 5 or 
-                        current_time - self.final_ack_time > 10.0):
+                    # Consider connection established after fewer retries under high loss
+                    elif (self.final_ack_retries >= 2 or  # Reduced from 5 to 3
+                        current_time - self.final_ack_time > self.rtt_stats["rto"] * 2.0):
                         print("Completed connection establishment phase")
                         self.final_handshake_ack = None
                         self.final_ack_time = None
                         self.connection_establishing = False
+                        
+                        with self.wait_cond:
+                            self.wait_cond.notify_all()
                 
                 data, addr = self.sock_fd.recvfrom(2048)
                 
@@ -669,7 +754,11 @@ class TransportSocket:
                             print(f"Valid ACK for our FIN in LAST_ACK, transitioning to CLOSED")
                             # Transition to CLOSED state
                             self.state = CLOSED
-                            self.wait_cond.notify_all()
+                            print(f"Connection closed, stopping all pending operations")
+                            with self.recv_lock:
+                                self.window["packets_in_flight"] = {}
+                                self.window["in_flight"] = 0
+                                self.wait_cond.notify_all()
                         else:
                             print(f"Received ACK {packet.ack} in LAST_ACK but expected at least {self.window['next_seq_to_send']}")
                     continue
@@ -720,6 +809,8 @@ class TransportSocket:
                                     # Remove from in-flight list
                                     del self.window["packets_in_flight"][seq]
                                     removed_packets += 1
+                                    
+                            self.update_congestion_control_on_ack(acked_bytes)
                             
                             # Update next expected sequence and in-flight data
                             self.window["next_seq_expected"] = packet.ack
@@ -742,7 +833,22 @@ class TransportSocket:
                             
                             # Notify any waiting sender
                             self.wait_cond.notify_all()
+                            
+                            # After processing an ACK that advances the window:
+                            print(f"Congestion control state: {self.congestion_control['state']}, " +
+                                f"cwnd: {self.congestion_control['cwnd']}, " +
+                                f"ssthresh: {self.congestion_control['ssthresh']}")
                         elif packet.ack == self.window["next_seq_expected"]:
+                            # Check if this could be a data packet for a still-establishing connection
+                            if self.state == ESTABLISHED and len(packet.payload) > 0:
+                                print(f"Received data packet with seq={packet.seq} during connection establishment")
+                                # Process it as a regular data packet instead of duplicate ACK
+                                # (your existing data processing code)
+                            else:
+                                # Duplicate ACK received
+                                self.window["dup_ack_count"] += 1
+                                print(f"Duplicate ACK received: {packet.ack}, count: {self.window['dup_ack_count']}")
+                            
                             # Duplicate ACK received
                             self.window["dup_ack_count"] += 1
                             print(f"Duplicate ACK received: {packet.ack}, count: {self.window['dup_ack_count']}")
@@ -751,30 +857,37 @@ class TransportSocket:
                                 # Triple duplicate ACK detected, trigger fast retransmit
                                 print(f"Triple duplicate ACK detected, triggering fast retransmit for ACK {packet.ack}")
                                 
-                                # The sequence number of the missing segment is the same as the ACK number
-                                missing_seq = packet.ack
+                                # Log in-flight packets for debugging
+                                print(f"In-flight packets: {list(self.window['packets_in_flight'].keys())}")
                                 
-                                # Find the segment to retransmit
-                                if missing_seq in self.window["packets_in_flight"]:
-                                    # Found the packet to retransmit
-                                    pkt, _ = self.window["packets_in_flight"][missing_seq]
-                                    print(f"Fast retransmitting packet with seq {missing_seq}, length {len(pkt.payload)} bytes")
+                                # TCP Tahoe treats triple duplicate ACKs like a timeout
+                                self.update_congestion_control_on_timeout()
+                                
+                                # The missing segment should be around the ACK number
+                                # Find the closest segment to retransmit
+                                missing_seq = packet.ack
+                                closest_seq = None
+                                min_distance = float('inf')
+                                
+                                for seq in self.window["packets_in_flight"].keys():
+                                    pkt, _ = self.window["packets_in_flight"][seq]
+                                    if seq <= missing_seq and missing_seq < seq + len(pkt.payload):
+                                        # This packet contains the missing byte
+                                        closest_seq = seq
+                                        break
+                                    # Find the closest packet if we can't find an exact match
+                                    distance = abs(seq - missing_seq)
+                                    if distance < min_distance:
+                                        min_distance = distance
+                                        closest_seq = seq
+                                
+                                if closest_seq is not None:
+                                    pkt, _ = self.window["packets_in_flight"][closest_seq]
+                                    print(f"Fast retransmitting packet with seq {closest_seq}, length {len(pkt.payload)} bytes")
                                     self.sock_fd.sendto(pkt.encode(), self.conn)
-                                    # Update send time for RTT calculation
-                                    self.window["packets_in_flight"][missing_seq] = (pkt, time.time())
+                                    self.window["packets_in_flight"][closest_seq] = (pkt, time.time())
                                 else:
-                                    # If the exact packet isn't found, search for a packet that covers this sequence range
-                                    found = False
-                                    for seq, (pkt, _) in sorted(self.window["packets_in_flight"].items()):
-                                        if seq <= missing_seq < seq + len(pkt.payload):
-                                            print(f"Fast retransmitting packet with seq {seq} that contains missing seq {missing_seq}")
-                                            self.sock_fd.sendto(pkt.encode(), self.conn)
-                                            self.window["packets_in_flight"][seq] = (pkt, time.time())
-                                            found = True
-                                            break
-                                    
-                                    if not found:
-                                        print(f"No packet found to retransmit for ACK {packet.ack}")
+                                    print(f"No packet found to retransmit for ACK {packet.ack}")
                                 
                                 # Reset the duplicate ACK counter after fast retransmit
                                 # This allows us to detect new losses after this retransmission
@@ -892,6 +1005,9 @@ class TransportSocket:
                 # Check if state changed
                 if self.state == ESTABLISHED:
                     print(f"Connection established successfully")
+                    if self.connection_establishing:
+                        print("Waiting for connection to fully complete...")
+                        self.wait_cond.wait(timeout=2.0)  # Wait a bit longer to ensure stability
                     return
                     
                 # Timeout occurred - retry or give up
@@ -1011,3 +1127,67 @@ class TransportSocket:
             self.rtt_stats["rto"] = min(DEFAULT_TIMEOUT, self.rtt_stats["rto"])
             
             print(f"RTT update: sample={sample_rtt:.4f}s, EstimatedRTT={self.rtt_stats['srtt']:.4f}s, TimeOut={self.rtt_stats['rto']:.4f}s")
+            
+    def update_congestion_control_on_ack(self, acked_bytes):
+        """
+        Update congestion window based on successful ACK (TCP Tahoe)
+        """
+        if acked_bytes <= 0:
+            return  # Skip if no new data acknowledged
+            
+        if self.congestion_control["state"] == "slow_start":
+            # In slow start, increase cwnd by MSS for each ACK
+            # This doubles cwnd approximately every RTT
+            old_cwnd = self.congestion_control["cwnd"]
+            self.congestion_control["cwnd"] += MSS
+            
+            print(f"-------------------------------")
+            print(f"Slow start: cwnd increased from {old_cwnd} to {self.congestion_control['cwnd']} bytes")
+            
+            # Check if we should transition to congestion avoidance
+            if self.congestion_control["cwnd"] >= self.congestion_control["ssthresh"]:
+                print(f"*** Transitioning to congestion avoidance: cwnd={self.congestion_control['cwnd']}, " + 
+                    f"ssthresh={self.congestion_control['ssthresh']} ***")
+                self.congestion_control["state"] = "congestion_avoidance"
+                self.congestion_control["segments_acked"] = 0
+            print(f"-------------------------------")
+                
+        elif self.congestion_control["state"] == "congestion_avoidance":
+            # In congestion avoidance, increase cwnd by MSS*MSS/cwnd for each ACK
+            # This effectively increases cwnd by 1 MSS per RTT
+            
+            # Count segments (MSS-sized chunks) that were acknowledged
+            segments = max(1, acked_bytes // MSS)
+            self.congestion_control["segments_acked"] += segments
+            
+            # If we've acknowledged at least cwnd/MSS segments, increase cwnd by 1 MSS
+            if self.congestion_control["segments_acked"] >= self.congestion_control["cwnd"] // MSS:
+                old_cwnd = self.congestion_control["cwnd"]
+                self.congestion_control["cwnd"] += MSS
+                self.congestion_control["segments_acked"] = 0
+                print(f"-------------------------------")
+                print(f"Congestion avoidance: cwnd increased from {old_cwnd} to {self.congestion_control['cwnd']} bytes")
+                print(f"-------------------------------")
+
+
+    def update_congestion_control_on_timeout(self):
+        """
+        Update congestion control on timeout detection (TCP Tahoe)
+        """
+        # Save previous values for logging
+        prev_cwnd = self.congestion_control["cwnd"]
+        prev_ssthresh = self.congestion_control["ssthresh"]
+        
+        # Implement TCP Tahoe behavior on packet loss:
+        # 1. Set ssthresh to half of current cwnd (minimum of 2*MSS)
+        # 2. Reset cwnd to one MSS (WINDOW_INITIAL_WINDOW_SIZE)
+        # 3. Go back to slow start
+        self.congestion_control["ssthresh"] = max(prev_cwnd // 2, 2 * MSS)
+        self.congestion_control["cwnd"] = WINDOW_INITIAL_WINDOW_SIZE  # 1 MSS
+        self.congestion_control["state"] = "slow_start"
+        self.congestion_control["segments_acked"] = 0
+        
+        print(f"CONGESTION EVENT: TCP Tahoe responding to packet loss")
+        print(f"   cwnd: {prev_cwnd} -> {self.congestion_control['cwnd']} bytes")
+        print(f"   ssthresh: {prev_ssthresh} -> {self.congestion_control['ssthresh']} bytes")
+        print(f"   state: -> slow_start")
