@@ -318,7 +318,6 @@ class TransportSocket:
         """
         Send 'data' in multiple smaller segments with flow control
         """
-        # At the beginning of the method:
         print(f"--- Congestion Control Status ---")
         print(f"State: {self.congestion_control['state']}")
         print(f"cwnd: {self.congestion_control['cwnd']} bytes")
@@ -376,7 +375,7 @@ class TransportSocket:
                     MSS  # Don't exceed our Maximum Segment Size
                 )
 
-                # Print the congestion control stats every 0.001 seconds
+                # Print the congestion control stats
                 if self.state != CLOSED and not self.dying:
                     if time.time() - last_print > 0.1:
                         print(f"Congestion control: cwnd={self.congestion_control['cwnd']}, " +
@@ -840,58 +839,53 @@ class TransportSocket:
                                 f"ssthresh: {self.congestion_control['ssthresh']}")
                         elif packet.ack == self.window["next_seq_expected"]:
                             # Check if this could be a data packet for a still-establishing connection
-                            if self.state == ESTABLISHED and len(packet.payload) > 0:
+                            if self.state == ESTABLISHED and len(packet.payload) > 0 and packet.seq == self.window["last_ack"]:
                                 print(f"Received data packet with seq={packet.seq} during connection establishment")
                                 # Process it as a regular data packet instead of duplicate ACK
-                                # (your existing data processing code)
+                                # We'll handle it in the data processing section
                             else:
                                 # Duplicate ACK received
                                 self.window["dup_ack_count"] += 1
                                 print(f"Duplicate ACK received: {packet.ack}, count: {self.window['dup_ack_count']}")
-                            
-                            # Duplicate ACK received
-                            self.window["dup_ack_count"] += 1
-                            print(f"Duplicate ACK received: {packet.ack}, count: {self.window['dup_ack_count']}")
-                            
-                            if self.window["dup_ack_count"] == 3:
-                                # Triple duplicate ACK detected, trigger fast retransmit
-                                print(f"Triple duplicate ACK detected, triggering fast retransmit for ACK {packet.ack}")
                                 
-                                # Log in-flight packets for debugging
-                                print(f"In-flight packets: {list(self.window['packets_in_flight'].keys())}")
-                                
-                                # TCP Tahoe treats triple duplicate ACKs like a timeout
-                                self.update_congestion_control_on_timeout()
-                                
-                                # The missing segment should be around the ACK number
-                                # Find the closest segment to retransmit
-                                missing_seq = packet.ack
-                                closest_seq = None
-                                min_distance = float('inf')
-                                
-                                for seq in self.window["packets_in_flight"].keys():
-                                    pkt, _ = self.window["packets_in_flight"][seq]
-                                    if seq <= missing_seq and missing_seq < seq + len(pkt.payload):
-                                        # This packet contains the missing byte
-                                        closest_seq = seq
-                                        break
-                                    # Find the closest packet if we can't find an exact match
-                                    distance = abs(seq - missing_seq)
-                                    if distance < min_distance:
-                                        min_distance = distance
-                                        closest_seq = seq
-                                
-                                if closest_seq is not None:
-                                    pkt, _ = self.window["packets_in_flight"][closest_seq]
-                                    print(f"Fast retransmitting packet with seq {closest_seq}, length {len(pkt.payload)} bytes")
-                                    self.sock_fd.sendto(pkt.encode(), self.conn)
-                                    self.window["packets_in_flight"][closest_seq] = (pkt, time.time())
-                                else:
-                                    print(f"No packet found to retransmit for ACK {packet.ack}")
-                                
-                                # Reset the duplicate ACK counter after fast retransmit
-                                # This allows us to detect new losses after this retransmission
-                                self.window["dup_ack_count"] = 0
+                                if self.window["dup_ack_count"] == 3:
+                                    # Triple duplicate ACK detected, trigger fast retransmit
+                                    print(f"Triple duplicate ACK detected, triggering fast retransmit for ACK {packet.ack}")
+                                    
+                                    # Log in-flight packets for debugging
+                                    print(f"In-flight packets: {list(self.window['packets_in_flight'].keys())}")
+                                    
+                                    # TCP Tahoe treats triple duplicate ACK like a timeout
+                                    self.update_congestion_control_on_timeout()
+                                    
+                                    # The missing segment should be around the ACK number
+                                    # Find the closest segment to retransmit
+                                    missing_seq = packet.ack
+                                    closest_seq = None
+                                    min_distance = float('inf')
+                                    
+                                    for seq in self.window["packets_in_flight"].keys():
+                                        pkt, _ = self.window["packets_in_flight"][seq]
+                                        if seq <= missing_seq and missing_seq < seq + len(pkt.payload):
+                                            # This packet contains the missing byte
+                                            closest_seq = seq
+                                            break
+                                        # Find the closest packet if we can't find an exact match
+                                        distance = abs(seq - missing_seq)
+                                        if distance < min_distance:
+                                            min_distance = distance
+                                            closest_seq = seq
+                                    
+                                    if closest_seq is not None:
+                                        pkt, _ = self.window["packets_in_flight"][closest_seq]
+                                        print(f"Fast retransmitting packet with seq {closest_seq}, length {len(pkt.payload)} bytes")
+                                        self.sock_fd.sendto(pkt.encode(), self.conn)
+                                        self.window["packets_in_flight"][closest_seq] = (pkt, time.time())
+                                    else:
+                                        print(f"No packet found to retransmit for ACK {packet.ack}")
+                                    
+                                    # Reset dup ACK counter
+                                    self.window["dup_ack_count"] = 0
 
                 # Data packet processing (if in ESTABLISHED state)
                 if self.state in [ESTABLISHED, CLOSE_WAIT] and len(packet.payload) > 0:
